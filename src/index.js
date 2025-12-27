@@ -29,6 +29,8 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
     const from = msg?.from;
     const text = msg?.text?.body;
+    console.log("INCOMING MESSAGE", { from, text });
+
 
     // Status updates vs. ignore
     if (!from || !text) return res.sendStatus(200);
@@ -45,9 +47,10 @@ app.post("/webhook", async (req, res) => {
 
     return res.sendStatus(200);
   } catch (e) {
-    console.error("Webhook error:", e?.response?.data || e);
-    return res.sendStatus(200);
-  }
+  console.error("Webhook error:", e?.response?.data || e?.message || e);
+  return res.sendStatus(200);
+}
+
 });
 
 const port = process.env.PORT || 3000;
