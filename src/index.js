@@ -1,326 +1,374 @@
+// src/index.js
 import express from "express";
 import crypto from "crypto";
-import { pool } from "./db.js";
+import axios from "axios";
+import dotenv from "dotenv";
+
+import {
+  ensureSchema,
+  getOrCreateCustomer,
+  startConversation,
+  getFlowState,
+  setFlowState,
+  clearFlowState,
+  getIdeaSoftTokenRow,
+  upsertIdeaSoftTokenRow,
+} from "./db.js";
+
+dotenv.config();
 
 const app = express();
 
-// Meta webhook POST JSON
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+// Meta webhook signature doğrulaması için RAW body lazım
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 const PORT = process.env.PORT || 10000;
 
-// ---------- Helpers ----------
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v22.0";
+const WA_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
+const WA_TOKEN = process.env.WA_TOKEN;
+const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+// IdeaSoft
+const IDEASOFT_AUTH_URL = process.env.IDEASOFT_AUTH_URL; // .../panel/auth
+const IDEASOFT_TOKEN_URL = process.env.IDEASOFT_TOKEN_URL; // .../oauth/v2/token
+const IDEASOFT_CLIENT_ID = process.env.IDEASOFT_CLIENT_ID;
+const IDEASOFT_CLIENT_SECRET = process.env.IDEASOFT_CLIENT_SECRET;
+const IDEASOFT_REDIRECT_URI = process.env.IDEASOFT_REDIRECT_URI;
+const IDEASOFT_SCOPE = process.env.IDEASOFT_SCOPE || "admin";
+const IDEASOFT_API_BASE_URL = process.env.IDEASOFT_API_BASE_URL; // https://toptansulama.myideasoft.com
+
+function verifyMetaSignature(req) {
+  if (!WEBHOOK_SECRET) return true; // dev için
+  const sig = req.get("x-hub-signature-256");
+  if (!sig) return false;
+
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", WEBHOOK_SECRET).update(req.rawBody).digest("hex");
+
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
-function is13DigitOrderNo(s) {
-  return typeof s === "string" && /^[0-9]{13}$/.test(s.trim());
+function pickFirst(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] != null && obj[k] !== "") return obj[k];
+  }
+  return null;
 }
 
-async function waSendText(to, text) {
-  const WA_TOKEN = mustEnv("WA_TOKEN");
-  const WA_PHONE_NUMBER_ID = mustEnv("WA_PHONE_NUMBER_ID");
+// -------- WhatsApp send ----------
+async function sendWhatsAppText(to, text) {
+  if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
+    console.error("Missing env: WA_PHONE_NUMBER_ID or WA_TOKEN");
+    return;
+  }
 
-  const url = `https://graph.facebook.com/v22.0/${WA_PHONE_NUMBER_ID}/messages`;
+  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${WA_PHONE_NUMBER_ID}/messages`;
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
+  await axios.post(
+    url,
+    {
       messaging_product: "whatsapp",
       to,
       type: "text",
       text: { body: text },
-    }),
-  });
-
-  const data = await r.json();
-  if (!r.ok) throw data;
-  return data;
-}
-
-// ---------- IdeaSoft token store ----------
-async function getIdeaSoftTokenRow() {
-  const r = await pool.query("SELECT * FROM ideasoft_tokens WHERE id=1");
-  return r.rows[0] || null;
-}
-
-async function upsertIdeaSoftToken({ access_token, refresh_token, expires_at }) {
-  await pool.query(
-    `INSERT INTO ideasoft_tokens (id, access_token, refresh_token, expires_at, updated_at)
-     VALUES (1, $1, $2, $3, NOW())
-     ON CONFLICT (id) DO UPDATE
-     SET access_token=EXCLUDED.access_token,
-         refresh_token=COALESCE(EXCLUDED.refresh_token, ideasoft_tokens.refresh_token),
-         expires_at=EXCLUDED.expires_at,
-         updated_at=NOW()`,
-    [access_token, refresh_token || null, expires_at || null]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    }
   );
 }
 
-function isExpired(expiresAt) {
-  if (!expiresAt) return false;
-  // 60sn buffer
-  return new Date(expiresAt).getTime() - Date.now() < 60_000;
-}
+// -------- IdeaSoft token helpers ----------
+async function exchangeIdeaSoftCodeForToken(code) {
+  const params = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: IDEASOFT_CLIENT_ID,
+    client_secret: IDEASOFT_CLIENT_SECRET,
+    redirect_uri: IDEASOFT_REDIRECT_URI,
+    code,
+  });
 
-async function exchangeCodeForToken(code) {
-  const TOKEN_URL = mustEnv("IDEASOFT_TOKEN_URL");
-  const CLIENT_ID = mustEnv("IDEASOFT_CLIENT_ID");
-  const CLIENT_SECRET = mustEnv("IDEASOFT_CLIENT_SECRET");
-  const REDIRECT_URI = mustEnv("IDEASOFT_REDIRECT_URI");
-
-  const body = new URLSearchParams();
-  body.set("grant_type", "authorization_code");
-  body.set("client_id", CLIENT_ID);
-  body.set("client_secret", CLIENT_SECRET);
-  body.set("redirect_uri", REDIRECT_URI);
-  body.set("code", code);
-
-  const r = await fetch(TOKEN_URL, {
-    method: "POST",
+  const r = await axios.post(IDEASOFT_TOKEN_URL, params, {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    timeout: 20000,
   });
 
-  const data = await r.json();
-  if (!r.ok) throw data;
-
-  // expires_in saniye olabilir
-  const expiresAt = data.expires_in
-    ? new Date(Date.now() + Number(data.expires_in) * 1000)
-    : null;
-
-  await upsertIdeaSoftToken({
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-    expires_at: expiresAt,
-  });
-
-  return data;
+  return r.data;
 }
 
 async function refreshIdeaSoftToken(refreshToken) {
-  const TOKEN_URL = mustEnv("IDEASOFT_TOKEN_URL");
-  const CLIENT_ID = mustEnv("IDEASOFT_CLIENT_ID");
-  const CLIENT_SECRET = mustEnv("IDEASOFT_CLIENT_SECRET");
-
-  const body = new URLSearchParams();
-  body.set("grant_type", "refresh_token");
-  body.set("client_id", CLIENT_ID);
-  body.set("client_secret", CLIENT_SECRET);
-  body.set("refresh_token", refreshToken);
-
-  const r = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: IDEASOFT_CLIENT_ID,
+    client_secret: IDEASOFT_CLIENT_SECRET,
+    refresh_token: refreshToken,
   });
 
-  const data = await r.json();
-  if (!r.ok) throw data;
+  const r = await axios.post(IDEASOFT_TOKEN_URL, params, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 20000,
+  });
 
-  const expiresAt = data.expires_in
-    ? new Date(Date.now() + Number(data.expires_in) * 1000)
+  return r.data;
+}
+
+async function getValidIdeaSoftAccessToken() {
+  const row = await getIdeaSoftTokenRow();
+  if (!row) return null;
+
+  const now = Date.now();
+  const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+
+  // Expire yoksa: olduğu gibi kullan (bazı sistemler böyle döner)
+  if (!expiresAt) return row.access_token;
+
+  // 60sn tampon
+  if (now < expiresAt - 60_000) return row.access_token;
+
+  // Expire olmuş: refresh dene
+  if (!row.refresh_token) return null;
+
+  const refreshed = await refreshIdeaSoftToken(row.refresh_token);
+  const newExpiresAt = refreshed.expires_in
+    ? new Date(Date.now() + refreshed.expires_in * 1000)
     : null;
 
-  await upsertIdeaSoftToken({
-    access_token: data.access_token,
-    refresh_token: data.refresh_token || refreshToken,
-    expires_at: expiresAt,
+  await upsertIdeaSoftTokenRow({
+    access_token: refreshed.access_token,
+    refresh_token: refreshed.refresh_token || row.refresh_token,
+    token_type: refreshed.token_type,
+    scope: refreshed.scope,
+    expires_at: newExpiresAt,
   });
 
-  return data.access_token;
+  return refreshed.access_token;
 }
 
-async function ensureIdeaSoftAccessToken() {
-  const row = await getIdeaSoftTokenRow();
-  if (!row) throw new Error("IdeaSoft token yok. Önce /ideasoft/connect ile bağla.");
+async function fetchIdeaSoftOrder(orderId) {
+  if (!IDEASOFT_API_BASE_URL) {
+    throw new Error("Missing env: IDEASOFT_API_BASE_URL (ör: https://toptansulama.myideasoft.com)");
+  }
+  const token = await getValidIdeaSoftAccessToken();
+  if (!token) {
+    throw new Error("IdeaSoft bağlı değil. /ideasoft/login ile bağla.");
+  }
 
-  if (!isExpired(row.expires_at)) return row.access_token;
+  const url = `${IDEASOFT_API_BASE_URL}/admin-api/orders/${encodeURIComponent(orderId)}`;
 
-  if (!row.refresh_token) throw new Error("IdeaSoft refresh_token yok. Yeniden yetkilendirme lazım.");
-
-  return await refreshIdeaSoftToken(row.refresh_token);
-}
-
-// ---------- IdeaSoft API ----------
-async function ideasoftFetch(path, { method = "GET" } = {}) {
-  const base = mustEnv("IDEASOFT_BASE_URL");
-  const token = await ensureIdeaSoftAccessToken();
-
-  const url = `${base}${path}`;
-  const r = await fetch(url, {
-    method,
+  const r = await axios.get(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
     },
+    timeout: 20000,
   });
 
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw data;
-  return data;
+  return r.data;
 }
 
-// LIST’ten 13 haneli sipariş numarası yakalama (field adları IdeaSoft’a göre değişebiliyor)
-function pickOrderNumber(o) {
-  return (
-    o?.orderNumber ||
-    o?.order_no ||
-    o?.orderNo ||
-    o?.number ||
-    o?.code ||
-    o?.order_code ||
-    null
-  );
+function formatOrderReply(orderId, order) {
+  // IdeaSoft response alanları değişebilir; güvenli şekilde yakala
+  const status =
+    pickFirst(order, ["statusName", "status", "orderStatus", "order_status", "state"]) ||
+    "Bilinmiyor";
+
+  const cargo =
+    pickFirst(order, ["shippingCompanyName", "cargoCompany", "shippingCompany", "carrierName"]) ||
+    null;
+
+  const trackingNo =
+    pickFirst(order, ["trackingNumber", "cargoTrackingNumber", "shipmentTrackingNumber"]) ||
+    null;
+
+  const trackingUrl =
+    pickFirst(order, ["trackingUrl", "cargoTrackingUrl", "shipmentTrackingUrl"]) ||
+    null;
+
+  let msg = `Sipariş no: ${orderId}\nDurum: ${status}`;
+
+  if (cargo) msg += `\nKargo: ${cargo}`;
+  if (trackingNo) msg += `\nTakip no: ${trackingNo}`;
+  if (trackingUrl) msg += `\nTakip linki: ${trackingUrl}`;
+
+  // “Bitti mi?” hissi verelim
+  msg += `\n\nİstersen alıcı adı/adres veya ödeme durumunu da gösterebilirim.`;
+
+  return msg;
 }
 
-function pickStatus(o) {
-  // farklı yapılara tolerans
-  return (
-    o?.status?.name ||
-    o?.status ||
-    o?.orderStatus?.name ||
-    o?.order_status ||
-    o?.state ||
-    null
-  );
-}
+// -------- Routes ----------
+app.get("/", (req, res) => res.send("OK"));
 
-async function findOrderBy13Digit(orderNo) {
-  // en pratik fallback: son X siparişi tarar (ilk sürüm için yeterli)
-  // Sonrasında IdeaSoft filtre paramı bulursak hızlandırırız.
-  const maxPages = 10;
-  const limit = 50;
-
-  for (let page = 1; page <= maxPages; page++) {
-    const data = await ideasoftFetch(`/admin-api/orders?page=${page}&limit=${limit}`);
-
-    // bazı API’lar {data:[...]} döner, bazıları direkt [...]
-    const list = Array.isArray(data) ? data : (data?.data || data?.items || []);
-    if (!Array.isArray(list) || list.length === 0) break;
-
-    const found = list.find((o) => String(pickOrderNumber(o)) === String(orderNo));
-    if (found) return found;
-  }
-
-  return null;
-}
-
-// ---------- Routes ----------
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
-
-// Meta verify
 app.get("/webhook", (req, res) => {
-  const VERIFY = mustEnv("WA_VERIFY_TOKEN");
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === VERIFY) {
+  if (mode === "subscribe" && token === WA_VERIFY_TOKEN) {
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-// IdeaSoft connect (1 kez)
-app.get("/ideasoft/connect", (req, res) => {
-  const AUTH_URL = mustEnv("IDEASOFT_AUTH_URL");
-  const CLIENT_ID = mustEnv("IDEASOFT_CLIENT_ID");
-  const REDIRECT_URI = mustEnv("IDEASOFT_REDIRECT_URI");
+app.post("/webhook", async (req, res) => {
+  try {
+    if (!verifyMetaSignature(req)) {
+      return res.status(401).send("Invalid signature");
+    }
 
-  const u = new URL(AUTH_URL);
-  u.searchParams.set("response_type", "code");
-  u.searchParams.set("client_id", CLIENT_ID);
-  u.searchParams.set("redirect_uri", REDIRECT_URI);
+    const body = req.body;
 
-  // scope gerekiyorsa buraya eklenir (dokümandaki scope adlarına göre)
-  // u.searchParams.set("scope", "orders_read");
+    // messages dışında event gelebilir -> patlama
+    const change = body?.entry?.[0]?.changes?.[0];
+    const value = change?.value;
 
-  res.redirect(u.toString());
+    const message = value?.messages?.[0];
+    const waId = message?.from;
+    const msgType = message?.type;
+    const text = message?.text?.body;
+
+    // Mesaj yoksa 200 dön (Meta retry yapmasın)
+    if (!waId || !msgType || !text) {
+      console.log("INCOMING (non-message event) ignored");
+      return res.sendStatus(200);
+    }
+
+    console.log("INCOMING MESSAGE", { from: waId, text, type: msgType });
+
+    const customer = await getOrCreateCustomer(waId, value?.contacts?.[0]?.profile?.name);
+    await startConversation(customer.id);
+
+    const state = await getFlowState(customer.id);
+
+    // 13 haneli sipariş no yakala
+    const match13 = text.match(/\b(\d{13})\b/);
+    const orderId = match13 ? match13[1] : null;
+
+    // Sipariş akışını tetikle
+    const lower = text.toLowerCase();
+    const wantsOrder =
+      lower.includes("sipariş") || lower.includes("kargo") || lower.includes("takip");
+
+    if (wantsOrder && !orderId) {
+      await setFlowState(customer.id, "order_tracking", "awaiting_order_id", {});
+      await sendWhatsAppText(
+        waId,
+        "Sipariş takibi için 13 haneli sipariş numaranı yazar mısın? (Örn: 2025010100001)"
+      );
+      return res.sendStatus(200);
+    }
+
+    // Flow state bekliyor ve 13 hane geldiyse -> sorgula
+    if ((state?.flow_name === "order_tracking" && state?.step === "awaiting_order_id" && orderId) || orderId) {
+      try {
+        const order = await fetchIdeaSoftOrder(orderId);
+        const reply = formatOrderReply(orderId, order);
+        await sendWhatsAppText(waId, reply);
+        await clearFlowState(customer.id);
+      } catch (err) {
+        const apiErr = err?.response?.data;
+        console.error("Order fetch error:", apiErr || err.message);
+
+        await sendWhatsAppText(
+          waId,
+          `Sipariş bulunamadı veya şu an kontrol edemedim.\nSipariş no: ${orderId}\n\nNot: IdeaSoft bağlantısı yoksa önce /ideasoft/login ile bağlamamız gerekiyor.`
+        );
+      }
+      return res.sendStatus(200);
+    }
+
+    // Default
+    await sendWhatsAppText(
+      waId,
+      "Merhaba! Sipariş takibi için 'Siparişim nerede?' yazabilir veya direkt 13 haneli sipariş numaranı gönderebilirsin."
+    );
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook handler error:", e?.response?.data || e);
+    return res.sendStatus(200);
+  }
+});
+
+// ---- IdeaSoft OAuth endpoints ----
+app.get("/ideasoft/login", (req, res) => {
+  if (!IDEASOFT_AUTH_URL || !IDEASOFT_CLIENT_ID || !IDEASOFT_REDIRECT_URI) {
+    return res.status(500).send("Missing IdeaSoft env (AUTH_URL/CLIENT_ID/REDIRECT_URI)");
+  }
+
+  const state = crypto.randomBytes(16).toString("hex");
+  const url =
+    `${IDEASOFT_AUTH_URL}` +
+    `?response_type=code` +
+    `&client_id=${encodeURIComponent(IDEASOFT_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(IDEASOFT_REDIRECT_URI)}` +
+    `&scope=${encodeURIComponent(IDEASOFT_SCOPE)}` +
+    `&state=${encodeURIComponent(state)}`;
+
+  return res.redirect(url);
 });
 
 app.get("/ideasoft/callback", async (req, res) => {
   try {
     const code = req.query.code;
     if (!code) return res.status(400).send("Missing code");
-    await exchangeCodeForToken(code);
-    res.send("IdeaSoft bağlandı ✅ Artık WhatsApp sipariş sorgusu çalışır.");
+
+    if (!IDEASOFT_TOKEN_URL || !IDEASOFT_CLIENT_SECRET) {
+      return res.status(500).send("Missing IdeaSoft env (TOKEN_URL/CLIENT_SECRET)");
+    }
+
+    const token = await exchangeIdeaSoftCodeForToken(code);
+
+    const expiresAt = token.expires_in
+      ? new Date(Date.now() + token.expires_in * 1000)
+      : null;
+
+    await upsertIdeaSoftTokenRow({
+      access_token: token.access_token,
+      refresh_token: token.refresh_token,
+      token_type: token.token_type,
+      scope: token.scope,
+      expires_at: expiresAt,
+    });
+
+    return res.send("IdeaSoft bağlantısı başarılı ✅ Artık WhatsApp sipariş sorgusu çalışır.");
   } catch (e) {
-    console.error("IdeaSoft callback error:", e);
-    res.status(500).send("Token alma hatası. Loglara bak.");
+    console.error("IdeaSoft callback error:", e?.response?.data || e);
+    return res.status(500).send("IdeaSoft token alınamadı. Loglara bak.");
   }
 });
 
-// WhatsApp messages
-app.post("/webhook", async (req, res) => {
+app.get("/ideasoft/token-status", async (req, res) => {
+  const row = await getIdeaSoftTokenRow();
+  if (!row) return res.json({ connected: false });
+  return res.json({
+    connected: true,
+    expires_at: row.expires_at,
+    updated_at: row.updated_at,
+    scope: row.scope,
+  });
+});
+
+// ---- start ----
+(async () => {
   try {
-    const body = req.body;
-
-    const changes = body?.entry?.[0]?.changes?.[0];
-    const value = changes?.value;
-
-    const msg = value?.messages?.[0];
-    if (!msg) return res.sendStatus(200);
-
-    const from = msg.from;
-    const type = msg.type;
-    const text = type === "text" ? msg.text?.body : null;
-
-    console.log("INCOMING MESSAGE", { from, text, type });
-
-    if (!from || !text) return res.sendStatus(200);
-
-    const incoming = text.trim();
-
-    if (incoming.toLowerCase().includes("sipariş") && incoming.toLowerCase().includes("nerede")) {
-      await waSendText(from, "Sipariş takibi için 13 haneli sipariş numaranı yazar mısın? (Örn: 1234567890123)");
-      return res.sendStatus(200);
-    }
-
-    if (is13DigitOrderNo(incoming)) {
-      // IdeaSoft’tan bul
-      let order = null;
-      try {
-        order = await findOrderBy13Digit(incoming);
-      } catch (e) {
-        console.error("IdeaSoft order fetch error:", e);
-        await waSendText(from, "Şu an sipariş sistemine bağlanamadım. 2 dk sonra tekrar dener misin?");
-        return res.sendStatus(200);
-      }
-
-      if (!order) {
-        await waSendText(from, `Sipariş no: ${incoming}\nBu numarayla sipariş bulamadım. Numara doğru mu?`);
-        return res.sendStatus(200);
-      }
-
-      const status = pickStatus(order) || "Durum bilgisi alınamadı";
-      const orderId = order.id || order.orderId || "?";
-
-      await waSendText(
-        from,
-        `Sipariş no: ${incoming}\nDurum: ${status}\n(Referans: ${orderId})`
-      );
-      return res.sendStatus(200);
-    }
-
-    // default
-    await waSendText(from, "Anladım. Sipariş takibi için 'Siparişim nerede' yazabilir veya 13 haneli sipariş numaranı gönderebilirsin.");
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook handler error:", err);
-    return res.sendStatus(200); // Meta tekrar denemesin diye 200 dön
+    await ensureSchema();
+    app.listen(PORT, () => console.log(`Server running on :${PORT}`));
+  } catch (e) {
+    console.error("Startup error:", e);
+    process.exit(1);
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on :${PORT}`);
-});
+})();
