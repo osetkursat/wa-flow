@@ -1,12 +1,33 @@
 // src/index.js
-const express = require("express");
-const crypto = require("crypto");
-const axios = require("axios");
-const qs = require("qs");
+import express from "express";
+import axios from "axios";
+import crypto from "crypto";
+import qs from "qs";
 
-const db = require("./db");
+import {
+  ensureSchema,
+  getOrCreateCustomer,
+  findOpenConversation,
+  startConversation,
+  touchConversation,
+  insertMessage,
+  getFlowState,
+  setFlowState,
+  clearFlowState,
+  getIdeaSoftToken,
+  saveIdeaSoftToken,
+} from "./db.js";
 
 const app = express();
+
+// raw body sakla (signature doğrulama için)
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 const PORT = process.env.PORT || 10000;
 
@@ -14,67 +35,231 @@ const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v22.0";
 const WA_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
 const WA_TOKEN = process.env.WA_TOKEN;
 const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET; // Meta App Secret önerilir
 
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-
-// IdeaSoft env
-const IDEASOFT_BASE_URL = process.env.IDEASOFT_BASE_URL;
-const IDEASOFT_AUTH_URL = process.env.IDEASOFT_AUTH_URL;
-const IDEASOFT_TOKEN_URL = process.env.IDEASOFT_TOKEN_URL;
+const IDEASOFT_BASE_URL = process.env.IDEASOFT_BASE_URL; // https://toptansulama.myideasoft.com
+const IDEASOFT_AUTH_URL = process.env.IDEASOFT_AUTH_URL; // https://toptansulama.myideasoft.com/panel/auth
+const IDEASOFT_TOKEN_URL = process.env.IDEASOFT_TOKEN_URL; // https://toptansulama.myideasoft.com/oauth/v2/token
 const IDEASOFT_CLIENT_ID = process.env.IDEASOFT_CLIENT_ID;
 const IDEASOFT_CLIENT_SECRET = process.env.IDEASOFT_CLIENT_SECRET;
-const IDEASOFT_REDIRECT_URI = process.env.IDEASOFT_REDIRECT_URI;
+const IDEASOFT_REDIRECT_URI = process.env.IDEASOFT_REDIRECT_URI; // https://wa-flow.onrender.com/ideasoft/callback
 
-function mustEnv(name, val) {
-  if (!val) throw new Error(`Missing env: ${name}`);
+function timingSafeEqual(a, b) {
+  const aa = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
 }
 
-function buildTextReply(text) {
-  return { type: "text", text: { body: text } };
+function verifySignature(req) {
+  if (!WEBHOOK_SECRET) return true; // secret yoksa doğrulama kapalı
+  const sig = req.get("x-hub-signature-256"); // "sha256=..."
+  if (!sig || !req.rawBody) return false;
+
+  const expected =
+    "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(req.rawBody).digest("hex");
+  return timingSafeEqual(sig, expected);
 }
 
-async function waSendText(to, text) {
-  mustEnv("WA_PHONE_NUMBER_ID", WA_PHONE_NUMBER_ID);
-  mustEnv("WA_TOKEN", WA_TOKEN);
+async function sendWAText(to, body) {
+  if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
+    console.error("Missing env: WA_PHONE_NUMBER_ID or WA_TOKEN");
+    return;
+  }
 
   const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${WA_PHONE_NUMBER_ID}/messages`;
   await axios.post(
     url,
-    { messaging_product: "whatsapp", to, ...buildTextReply(text) },
-    { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    }
   );
 }
 
-function verifySignature(req) {
-  // Meta: X-Hub-Signature-256: sha256=...
-  if (!WEBHOOK_SECRET) return true; // istersen kapat: secret yoksa doğrulama yapma
-  const sig = req.get("x-hub-signature-256");
-  if (!sig) return true; // bazen gelmeyebiliyor; zorlamayalım
+function extractIncomingText(message) {
+  const type = message?.type;
+  if (type === "text") return message?.text?.body || "";
+  if (type === "button") return message?.button?.text || "";
+  if (type === "interactive") {
+    const i = message?.interactive;
+    return (
+      i?.button_reply?.title ||
+      i?.list_reply?.title ||
+      i?.list_reply?.id ||
+      ""
+    );
+  }
+  return "";
+}
 
-  const raw = req.rawBody || "";
-  const expected =
-    "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
+function isOrderNumber13(text) {
+  const t = (text || "").trim();
+  return /^\d{13}$/.test(t);
+}
+
+function normalizeText(text) {
+  return (text || "").toLocaleLowerCase("tr-TR").trim();
+}
+
+async function ideasoftTokenRefresh(refreshToken) {
+  const payload = qs.stringify({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: IDEASOFT_CLIENT_ID,
+    client_secret: IDEASOFT_CLIENT_SECRET,
+  });
+
+  const r = await axios.post(IDEASOFT_TOKEN_URL, payload, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
+  });
+
+  await saveIdeaSoftToken(r.data);
+  return r.data.access_token;
+}
+
+async function ideasoftRequest(method, url, accessToken) {
+  return axios.request({
+    method,
+    url,
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: 15000,
+  });
+}
+
+// 13 haneli “sipariş numarası” ile bulmaya çalışır.
+// 1) önce GET /orders/{id} dener
+// 2) olmazsa LIST üzerinde search/keyword denemesi yapar (API farklıysa yine de güvenli fallback)
+async function lookupOrderByNumber(orderNo) {
+  const tokenRow = await getIdeaSoftToken();
+  if (!tokenRow?.access_token) {
+    return { error: "IDEASOFT_NOT_CONNECTED" };
+  }
+
+  if (!IDEASOFT_BASE_URL) return { error: "IDEASOFT_BASE_URL_MISSING" };
+
+  let accessToken = tokenRow.access_token;
+
+  const tryGet = async () => {
+    const url = `${IDEASOFT_BASE_URL}/admin-api/orders/${encodeURIComponent(orderNo)}`;
+    return ideasoftRequest("GET", url, accessToken);
+  };
+
+  const tryList = async () => {
+    const base = `${IDEASOFT_BASE_URL}/admin-api/orders`;
+    // bazı sistemlerde search paramı çalışır, bazısında çalışmaz. Deniyoruz.
+    const url1 = `${base}?search=${encodeURIComponent(orderNo)}`;
+    const url2 = `${base}?q=${encodeURIComponent(orderNo)}`;
+    try {
+      return await ideasoftRequest("GET", url1, accessToken);
+    } catch {
+      return await ideasoftRequest("GET", url2, accessToken);
+    }
+  };
 
   try {
-    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
-  } catch {
-    return false;
+    const r = await tryGet();
+    return { order: r.data };
+  } catch (e) {
+    // token expired olabilir -> refresh dene
+    const status = e?.response?.status;
+    if ((status === 401 || status === 403) && tokenRow.refresh_token) {
+      accessToken = await ideasoftTokenRefresh(tokenRow.refresh_token);
+      try {
+        const r2 = await tryGet();
+        return { order: r2.data };
+      } catch {
+        // get yine olmadı -> list dene
+      }
+    }
+  }
+
+  try {
+    const r = await tryList();
+    const data = r.data;
+
+    // olası şekiller: {data:[...]} veya doğrudan array
+    const items = Array.isArray(data) ? data : Array.isArray(data?.data) ? data.data : [];
+
+    // alan adları değişebilir; olabildiğince esnek eşleştir
+    const found =
+      items.find((x) => String(x?.order_number || x?.orderNumber || x?.number || "") === orderNo) ||
+      items.find((x) => String(x?.id || "") === orderNo) ||
+      items[0];
+
+    if (!found) return { error: "ORDER_NOT_FOUND" };
+    return { order: found };
+  } catch (e) {
+    return { error: "ORDER_LOOKUP_FAILED", detail: e?.response?.data || e?.message };
   }
 }
 
-// raw body lazım (signature için)
-app.use(
-  express.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf.toString("utf8");
-    },
-  })
-);
+function pick(obj, paths) {
+  for (const p of paths) {
+    const parts = p.split(".");
+    let cur = obj;
+    let ok = true;
+    for (const part of parts) {
+      if (cur && Object.prototype.hasOwnProperty.call(cur, part)) cur = cur[part];
+      else {
+        ok = false;
+        break;
+      }
+    }
+    if (ok && cur != null && cur !== "") return cur;
+  }
+  return null;
+}
 
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+function formatOrderReply(orderNo, order) {
+  const status =
+    pick(order, [
+      "status.name",
+      "status",
+      "orderStatus.name",
+      "order_status",
+      "state",
+    ]) || "Durum bilgisi alınamadı";
 
-// Webhook verify
+  const cargo =
+    pick(order, [
+      "shipment.shipping_company",
+      "shipment.company",
+      "shippingCompany",
+      "cargoCompany",
+    ]) || null;
+
+  const tracking =
+    pick(order, [
+      "shipment.tracking_url",
+      "shipment.trackingUrl",
+      "trackingUrl",
+      "tracking_url",
+      "trackingLink",
+    ]) || null;
+
+  let msg = `Sipariş no: ${orderNo}\nDurum: ${status}`;
+  if (cargo) msg += `\nKargo: ${cargo}`;
+  if (tracking) msg += `\nTakip: ${tracking}`;
+  msg += `\n\nİstersen “kargo firması” veya “takip linki” diye yaz, varsa ayrıca göstereyim.`;
+  return msg;
+}
+
+// Sağlık kontrol
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
+// WhatsApp webhook verify (GET)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -86,32 +271,122 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ----- IdeaSoft OAuth -----
-function ideasoftAuthRedirectUrl() {
-  mustEnv("IDEASOFT_AUTH_URL", IDEASOFT_AUTH_URL);
-  mustEnv("IDEASOFT_CLIENT_ID", IDEASOFT_CLIENT_ID);
-  mustEnv("IDEASOFT_REDIRECT_URI", IDEASOFT_REDIRECT_URI);
-
-  // IdeaSoft tarafı scope istemeyebilir; varsa IDEASOFT_SCOPES ile geçersin
-  const scope = process.env.IDEASOFT_SCOPES;
-
-  const params = {
-    response_type: "code",
-    client_id: IDEASOFT_CLIENT_ID,
-    redirect_uri: IDEASOFT_REDIRECT_URI,
-    ...(scope ? { scope } : {}),
-  };
-
-  return `${IDEASOFT_AUTH_URL}?${qs.stringify(params)}`;
-}
-
-app.get("/ideasoft/connect", (req, res) => {
+// WhatsApp webhook (POST)
+app.post("/webhook", async (req, res) => {
   try {
-    const url = ideasoftAuthRedirectUrl();
-    res.redirect(url);
-  } catch (e) {
-    res.status(500).send(String(e.message || e));
+    if (!verifySignature(req)) {
+      return res.sendStatus(401);
+    }
+
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+
+    const messages = value?.messages || [];
+    const contacts = value?.contacts || [];
+
+    if (!messages.length) {
+      // status vb event’ler
+      return res.sendStatus(200);
+    }
+
+    const contactName = contacts?.[0]?.profile?.name || null;
+
+    for (const m of messages) {
+      const from = m?.from; // wa_id
+      const text = extractIncomingText(m);
+      const type = m?.type;
+
+      if (!from) continue;
+
+      console.log("INCOMING MESSAGE", { from, text, type });
+
+      // DB kayıt
+      const customer = await getOrCreateCustomer(from, contactName);
+      let convId = await findOpenConversation(customer.id);
+      if (!convId) convId = await startConversation(customer.id);
+
+      await insertMessage(convId, "in", text, req.body);
+      await touchConversation(convId);
+
+      // Flow
+      const lower = normalizeText(text);
+      const flow = await getFlowState(customer.id);
+
+      if (lower.includes("ideasoft bağla") || lower.includes("connect")) {
+        const link = `${req.protocol}://${req.get("host")}/ideasoft/connect`;
+        await sendWAText(from, `IdeaSoft bağlantısı için bu linki aç: ${link}`);
+        continue;
+      }
+
+      if (lower.includes("siparişim nerede") || lower.includes("siparisim nerede") || lower === "sipariş" || lower === "siparis") {
+        await setFlowState(customer.id, "order_tracking", "await_order_number", {});
+        await sendWAText(from, "Sipariş takibi için 13 haneli sipariş numaranı yazar mısın? (Örn: 2025010100001)");
+        continue;
+      }
+
+      // 13 haneli geldiyse (veya flow bunu bekliyorsa)
+      const expectingOrder = flow?.flow_name === "order_tracking" && flow?.step === "await_order_number";
+      if (isOrderNumber13(text) || expectingOrder) {
+        const orderNo = (text || "").trim();
+
+        if (!isOrderNumber13(orderNo)) {
+          await sendWAText(from, "Sipariş numarası 13 hane olmalı. (Sadece rakam) Örn: 2025010100001");
+          continue;
+        }
+
+        const result = await lookupOrderByNumber(orderNo);
+
+        if (result.error === "IDEASOFT_NOT_CONNECTED") {
+          const link = `${req.protocol}://${req.get("host")}/ideasoft/connect`;
+          await sendWAText(from, `IdeaSoft bağlantısı yapılmamış. Bağlamak için bu linki aç: ${link}`);
+          continue;
+        }
+
+        if (result.error === "ORDER_NOT_FOUND") {
+          await sendWAText(from, `Sipariş bulunamadı: ${orderNo}\nNumarayı kontrol edip tekrar yazar mısın?`);
+          continue;
+        }
+
+        if (result.error) {
+          console.error("Order lookup error:", result);
+          await sendWAText(from, "Sipariş sorgusunda hata oldu. Birazdan tekrar dener misin?");
+          continue;
+        }
+
+        await clearFlowState(customer.id);
+        await sendWAText(from, formatOrderReply(orderNo, result.order));
+        continue;
+      }
+
+      // default
+      await sendWAText(
+        from,
+        `Merhaba! Sipariş takibi için "Siparişim nerede" yazabilir veya direkt 13 haneli sipariş numaranı gönderebilirsin.`
+      );
+    }
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error("Webhook handler error:", err?.response?.data || err);
+    return res.sendStatus(200); // Meta tekrar tekrar denemesin
   }
+});
+
+// --- IdeaSoft OAuth ---
+app.get("/ideasoft/connect", (req, res) => {
+  if (!IDEASOFT_AUTH_URL || !IDEASOFT_CLIENT_ID || !IDEASOFT_REDIRECT_URI) {
+    return res
+      .status(500)
+      .send("Missing IdeaSoft env. Check IDEASOFT_AUTH_URL / IDEASOFT_CLIENT_ID / IDEASOFT_REDIRECT_URI");
+  }
+
+  const url = new URL(IDEASOFT_AUTH_URL);
+  url.searchParams.set("client_id", IDEASOFT_CLIENT_ID);
+  url.searchParams.set("redirect_uri", IDEASOFT_REDIRECT_URI);
+  url.searchParams.set("response_type", "code");
+  // scope gerekiyorsa buraya ekleyebiliriz (dokümanına göre)
+  return res.redirect(url.toString());
 });
 
 app.get("/ideasoft/callback", async (req, res) => {
@@ -119,222 +394,36 @@ app.get("/ideasoft/callback", async (req, res) => {
     const code = req.query.code;
     if (!code) return res.status(400).send("Missing code");
 
-    mustEnv("IDEASOFT_TOKEN_URL", IDEASOFT_TOKEN_URL);
-    mustEnv("IDEASOFT_CLIENT_ID", IDEASOFT_CLIENT_ID);
-    mustEnv("IDEASOFT_CLIENT_SECRET", IDEASOFT_CLIENT_SECRET);
-    mustEnv("IDEASOFT_REDIRECT_URI", IDEASOFT_REDIRECT_URI);
+    if (!IDEASOFT_TOKEN_URL || !IDEASOFT_CLIENT_ID || !IDEASOFT_CLIENT_SECRET || !IDEASOFT_REDIRECT_URI) {
+      return res.status(500).send("Missing IdeaSoft token env");
+    }
 
-    const body = qs.stringify({
+    const payload = qs.stringify({
       grant_type: "authorization_code",
       code,
+      client_id: IDEASOFT_CLIENT_ID,
+      client_secret: IDEASOFT_CLIENT_SECRET,
       redirect_uri: IDEASOFT_REDIRECT_URI,
-      client_id: IDEASOFT_CLIENT_ID,
-      client_secret: IDEASOFT_CLIENT_SECRET,
     });
 
-    const tokenResp = await axios.post(IDEASOFT_TOKEN_URL, body, {
+    const r = await axios.post(IDEASOFT_TOKEN_URL, payload, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000,
     });
 
-    await db.saveIdeaSoftToken(tokenResp.data);
+    await saveIdeaSoftToken(r.data);
 
-    res.status(200).send("IdeaSoft bağlandı ✅ Token kaydedildi. WhatsApp’tan test edebilirsin.");
-  } catch (e) {
-    console.error("ideasoft callback error:", e.response?.data || e.message || e);
-    res.status(500).send("IdeaSoft token alınamadı. Loglara bak.");
+    return res
+      .status(200)
+      .send("IdeaSoft bağlantısı tamam ✅ Bu sayfayı kapatabilirsin. WhatsApp’tan sipariş numarası gönder.");
+  } catch (err) {
+    console.error("IdeaSoft callback error:", err?.response?.data || err);
+    return res.status(500).send("IdeaSoft callback failed. Loglara bak.");
   }
 });
 
-async function refreshIdeaSoftTokenIfNeeded() {
-  const t = await db.getIdeaSoftToken();
-  if (!t) return null;
+await ensureSchema();
 
-  if (!t.expires_at) return t; // expires gelmiyorsa “idare et”
-  const exp = new Date(t.expires_at).getTime();
-  const now = Date.now();
-
-  // 60 sn tolerans
-  if (exp - now > 60 * 1000) return t;
-
-  // refresh token yoksa yenileyemeyiz
-  if (!t.refresh_token) return t;
-
-  try {
-    const body = qs.stringify({
-      grant_type: "refresh_token",
-      refresh_token: t.refresh_token,
-      client_id: IDEASOFT_CLIENT_ID,
-      client_secret: IDEASOFT_CLIENT_SECRET,
-    });
-
-    const tokenResp = await axios.post(IDEASOFT_TOKEN_URL, body, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    });
-
-    await db.saveIdeaSoftToken(tokenResp.data);
-    return await db.getIdeaSoftToken();
-  } catch (e) {
-    console.error("ideasoft refresh error:", e.response?.data || e.message || e);
-    return t;
-  }
-}
-
-async function ideasoftGetOrder(orderNo) {
-  mustEnv("IDEASOFT_BASE_URL", IDEASOFT_BASE_URL);
-
-  let t = await refreshIdeaSoftTokenIfNeeded();
-  if (!t || !t.access_token) {
-    throw new Error("IdeaSoft bağlı değil. /ideasoft/connect ile bağla.");
-  }
-
-  // 1) Direkt /orders/{id} dene (senin 13 haneli no çoğu panelde bu oluyor)
-  const url1 = `${IDEASOFT_BASE_URL}/admin-api/orders/${encodeURIComponent(orderNo)}`;
-
-  try {
-    const r = await axios.get(url1, {
-      headers: { Authorization: `Bearer ${t.access_token}` },
-    });
-    return r.data;
-  } catch (e) {
-    // 404/400 olabilir => 2) LIST ile arama dene (API destekliyorsa)
-    const status = e.response?.status;
-
-    if (status && status !== 404 && status !== 400) {
-      throw e;
-    }
-
-    const url2 = `${IDEASOFT_BASE_URL}/admin-api/orders?${qs.stringify({
-      search: orderNo,
-      per_page: 1,
-    })}`;
-
-    const r2 = await axios.get(url2, {
-      headers: { Authorization: `Bearer ${t.access_token}` },
-    });
-
-    // Bazı API’lar {data:[...]} döner, bazıları direkt [...]
-    const list = Array.isArray(r2.data) ? r2.data : (r2.data?.data || r2.data?.items || []);
-    if (!list.length) throw new Error("Sipariş bulunamadı.");
-    return list[0];
-  }
-}
-
-function extractOrderStatus(order) {
-  // alan adları dokümana göre değişebiliyor, olabildiğince esnek ol
-  return (
-    order?.orderStatus?.name ||
-    order?.order_status?.name ||
-    order?.orderStatus ||
-    order?.status ||
-    order?.statusName ||
-    order?.state ||
-    "Bilinmiyor"
-  );
-}
-
-function looksLikeOrderNo13(text) {
-  return /^[0-9]{13}$/.test((text || "").trim());
-}
-
-// ----- WhatsApp webhook handler -----
-app.post("/webhook", async (req, res) => {
-  if (!verifySignature(req)) return res.sendStatus(401);
-
-  try {
-    const body = req.body;
-
-    const change = body?.entry?.[0]?.changes?.[0]?.value;
-    const messages = change?.messages;
-
-    if (!messages || !messages.length) {
-      // status / delivery event vb.
-      return res.status(200).send("OK");
-    }
-
-    const msg = messages[0];
-    const from = msg.from;
-    const waMessageId = msg.id;
-
-    // duplicate event gelirse aynı mesajı tekrar işleme
-    if (await db.hasIncomingWaMessageId(waMessageId)) {
-      return res.status(200).send("OK");
-    }
-
-    const name = change?.contacts?.[0]?.profile?.name || null;
-
-    const type = msg.type;
-    let text = null;
-
-    if (type === "text") text = msg.text?.body || "";
-    else if (type === "button") text = msg.button?.text || "";
-    else if (type === "interactive") {
-      text =
-        msg.interactive?.button_reply?.title ||
-        msg.interactive?.list_reply?.title ||
-        "";
-    } else {
-      text = "";
-    }
-
-    console.log("INCOMING MESSAGE", { from, text, type });
-
-    const customer = await db.getOrCreateCustomer({ phone: from, name });
-    let convoId = await db.getOpenConversation(customer.id);
-    if (!convoId) convoId = await db.startConversation(customer.id);
-
-    await db.touchConversation(convoId);
-    await db.recordMessage({ conversationId: convoId, direction: "in", text, rawPayload: msg });
-
-    const flow = await db.getFlowState(customer.id);
-
-    // ---- Basit akış ----
-    const normalized = (text || "").toLowerCase();
-
-    if (flow.state === "awaiting_order_number") {
-      if (!looksLikeOrderNo13(text)) {
-        await waSendText(from, "Sipariş takibi için **13 haneli** sipariş numaranı yaz lütfen. (Örn: 2025010100001)");
-        return res.status(200).send("OK");
-      }
-
-      // IdeaSoft’tan çek
-      try {
-        const order = await ideasoftGetOrder(text.trim());
-        const statusText = extractOrderStatus(order);
-
-        await waSendText(
-          from,
-          `Sipariş no: ${text.trim()}\nDurum: ${statusText}\n\nİstersen “kargo” yaz, kargo bilgisi/ takip linki varsa ayrıca da döndürebilirim.`
-        );
-
-        await db.setFlowState(customer.id, "idle", {});
-      } catch (e) {
-        console.error("Order lookup error:", e.response?.data || e.message || e);
-        await waSendText(
-          from,
-          `Siparişi sorgularken hata aldım.\n\nMuhtemel sebepler:\n- IdeaSoft bağlantısı yok (bağlamak için: ${process.env.PUBLIC_BASE_URL || "https://wa-flow.onrender.com"}/ideasoft/connect)\n- Sipariş no yanlış\n\nTekrar dener misin?`
-        );
-      }
-
-      return res.status(200).send("OK");
-    }
-
-    // trigger: sipariş takibi
-    if (normalized.includes("sipariş") || normalized.includes("siparis") || normalized.includes("nerede")) {
-      await db.setFlowState(customer.id, "awaiting_order_number", {});
-      await waSendText(from, "Sipariş takibi için 13 haneli sipariş numaranı yazar mısın? (Örn: 2025010100001)");
-      return res.status(200).send("OK");
-    }
-
-    // default help
-    await waSendText(from, "Merhaba! Sipariş takibi için “Siparişim nerede” yazabilir veya direkt 13 haneli sipariş numaranı gönderebilirsin.");
-    return res.status(200).send("OK");
-  } catch (e) {
-    console.error("Webhook handler error:", e.response?.data || e.message || e);
-    return res.status(200).send("OK");
-  }
+app.listen(PORT, () => {
+  console.log(`Server running on :${PORT}`);
 });
-
-(async () => {
-  await db.initDb();
-  app.listen(PORT, () => console.log(`Server running on :${PORT}`));
-})();
